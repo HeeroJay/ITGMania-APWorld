@@ -331,116 +331,31 @@ AP.MakeStatusOverlayActor = function()
 		end
 	end
 
-	-- Custom overlay input callback. Consumes all inputs when overlay is active
-	local function input(event)
-		if not overlay_visible then return false end
-		if not event then return false end
-		
-		if event.type ~= "InputEventType_FirstPress" then
-			return false
-		end
-		
-		local key = event.DeviceInput and event.DeviceInput.button
-		local game_btn = event.GameButton
-		
-		-- Global escape / cancel keys
-		if key == "DeviceButton_escape" or key == "DeviceButton_F10" or game_btn == "Back" then
-			overlay_visible = false
-			SOUND:PlayOnce(THEME:GetPathS("Common", "Cancel"))
-			for player in ivalues(PlayerNumber) do
-				SCREENMAN:set_input_redirected(player, false)
-			end
-			MESSAGEMAN:Broadcast("APStatusRefresh")
-			return true
-		end
-		
-		if key == "DeviceButton_r" or key == "DeviceButton_R" then
-			local apHandler = AP.GetAPHandlerInstance()
-			if apHandler and apHandler.connected then
-				-- Sync and regenerate playlist
-				AP.UpdatePlaylist()
-				
-				if apHandler.socket then
-					local sync_packet = { ["cmd"] = "Sync" }
-					local payload = JsonEncode({ sync_packet })
-					apHandler.socket:Send(payload, false)
-					AP.Trace("Requested Archipelago sync...")
-				end
-				
-				SOUND:PlayOnce(THEME:GetPathS("", "_unlock.ogg"))
-				MESSAGEMAN:Broadcast("APStatusRefresh")
-			else
-				AP.Trace("Cannot sync or update playlist: Offline.")
-				SOUND:PlayOnce(THEME:GetPathS("Common", "Cancel"))
-			end
-			return true
-		end
-		
-		if not (event.PlayerNumber and event.button) then
-			return false
-		end
-		
-		local songs = AP.GetUnlockedSongs()
-		local num_songs = #songs
-		
-		if game_btn == "MenuDown" or key == "DeviceButton_down" then
-			-- Scroll down
-			if selectedIndex < num_songs then
-				selectedIndex = selectedIndex + 1
-				if selectedIndex > scrollOffset + 9 then
-					scrollOffset = selectedIndex - 9
-				end
-				SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
-				MESSAGEMAN:Broadcast("APStatusRefresh")
-			end
-		elseif game_btn == "MenuUp" or key == "DeviceButton_up" then
-			-- Scroll up
-			if selectedIndex > 1 then
-				selectedIndex = selectedIndex - 1
-				if selectedIndex < scrollOffset then
-					scrollOffset = selectedIndex
-				end
-				SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
-				MESSAGEMAN:Broadcast("APStatusRefresh")
-			end
-		elseif game_btn == "Start" or game_btn == "Select" then
-			-- Toggle overlay off
-			overlay_visible = false
-			SOUND:PlayOnce(THEME:GetPathS("Common", "Cancel"))
-			for player in ivalues(PlayerNumber) do
-				SCREENMAN:set_input_redirected(player, false)
-			end
-			MESSAGEMAN:Broadcast("APStatusRefresh")
-		end
-		
-		return true -- consume input
-	end
-
 	-- Toggle overlay active state, routing player input and registering the input listener
 	local function toggleOverlay(self)
 		overlay_visible = not overlay_visible
 		scrollOffset = 1
 		selectedIndex = 1
 		
-		local screen = SCREENMAN:GetTopScreen()
 		if overlay_visible then
 			SOUND:PlayOnce(THEME:GetPathS("Common", "Start"))
-			for player in ivalues(PlayerNumber) do
-				SCREENMAN:set_input_redirected(player, true)
+			if status_overlay_actor then
+				status_overlay_actor:playcommand("DirectInputToAPStatusOverlay")
 			end
 		else
 			SOUND:PlayOnce(THEME:GetPathS("Common", "Cancel"))
-			for player in ivalues(PlayerNumber) do
-				SCREENMAN:set_input_redirected(player, false)
+			if status_overlay_actor then
+				status_overlay_actor:queuecommand("DirectInputToEngineFromStatusOverlay")
 			end
 		end
 		
-		self:playcommand("Refresh")
+		MESSAGEMAN:Broadcast("APStatusRefresh")
 	end
 
 	-- Persistent listener registered at screen boot to capture F10 toggle presses
 	local function F10_listener(event)
-		if event.type == "InputEventType_FirstPress" and event.DeviceInput.button == "DeviceButton_F10" then
+		if overlay_visible then return false end
+		if event.type == "InputEventType_FirstPress" and event.DeviceInput and event.DeviceInput.button == "DeviceButton_F10" then
 			if status_overlay_actor then
 				status_overlay_actor:playcommand("ToggleOverlay")
 			end
@@ -490,28 +405,144 @@ AP.MakeStatusOverlayActor = function()
 		Name = "APStatusOverlayMain",
 		InitCommand = function(self)
 			status_overlay_actor = self
+			self.statusOverlayInputHandler = nil
+			self.armed = false
 			overlay_visible = false
 			scrollOffset = 1
 			selectedIndex = 1
 		end,
+		ScreenChangedMessageCommand = function(self)
+			if not self.armed then return end
+			local screen = SCREENMAN:GetTopScreen()
+			if not screen or not screen:GetName():find("ScreenSelectMusic") then
+				self.armed = false
+				self:playcommand("DirectInputToEngineFromStatusOverlay")
+				overlay_visible = false
+			end
+		end,
 		ModuleCommand = function(self)
+			self:stoptweening()
+			self.armed = true
 			local screen = SCREENMAN:GetTopScreen()
 			if screen then
 				screen:RemoveInputCallback(F10_listener)
 				screen:AddInputCallback(F10_listener)
-				screen:RemoveInputCallback(input)
-				screen:AddInputCallback(input)
 			end
+
+			-- Defensively release any leftover input redirection
+			self:playcommand("DirectInputToEngineFromStatusOverlay")
+
+			overlay_visible = false
+			MESSAGEMAN:Broadcast("APStatusRefresh")
 		end,
-		OffCommand = function(self)
-			local screen = SCREENMAN:GetTopScreen()
-			if screen then
-				screen:RemoveInputCallback(F10_listener)
-				screen:RemoveInputCallback(input)
+		DirectInputToAPStatusOverlayCommand = function(self)
+			local top = SCREENMAN:GetTopScreen()
+			if not top then return end
+
+			for player in ivalues(PlayerNumber) do
+				SCREENMAN:set_input_redirected(player, true)
 			end
+
+			if self.statusOverlayInputHandler then return end
+
+			self.statusOverlayInputHandler = function(event)
+				if not overlay_visible then return false end
+
+				-- Re-assert input redirection on every event while overlay is active
+				for player in ivalues(PlayerNumber) do
+					SCREENMAN:set_input_redirected(player, true)
+				end
+
+				if not event then return false end
+				if event.type ~= "InputEventType_FirstPress" then
+					return true -- Consume repeat / release events while overlay is active
+				end
+
+				local key = event.DeviceInput and event.DeviceInput.button
+				local game_btn = event.GameButton
+
+				-- Global escape / cancel / close keys
+				if key == "DeviceButton_escape" or key == "DeviceButton_F10" or game_btn == "Back" or game_btn == "Start" then
+					toggleOverlay(self)
+					return true
+				end
+
+				if key == "DeviceButton_r" or key == "DeviceButton_R" then
+					local apHandler = AP.GetAPHandlerInstance()
+					if apHandler and apHandler.connected then
+						-- Sync and regenerate playlist
+						AP.UpdatePlaylist()
+						
+						if apHandler.socket then
+							local sync_packet = { ["cmd"] = "Sync" }
+							local payload = JsonEncode({ sync_packet })
+							apHandler.socket:Send(payload, false)
+							AP.Trace("Requested Archipelago sync...")
+						end
+						
+						SOUND:PlayOnce(THEME:GetPathS("", "_unlock.ogg"))
+						MESSAGEMAN:Broadcast("APStatusRefresh")
+					else
+						AP.Trace("Cannot sync or update playlist: Offline.")
+						SOUND:PlayOnce(THEME:GetPathS("Common", "Cancel"))
+					end
+					return true
+				end
+
+				if not (event.PlayerNumber and event.button) then
+					return true
+				end
+
+				local songs = AP.GetUnlockedSongs()
+				local num_songs = #songs
+
+				if game_btn == "MenuDown" or key == "DeviceButton_down" then
+					-- Scroll down
+					if selectedIndex < num_songs then
+						selectedIndex = selectedIndex + 1
+						if selectedIndex > scrollOffset + 9 then
+							scrollOffset = selectedIndex - 9
+						end
+						SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
+						MESSAGEMAN:Broadcast("APStatusRefresh")
+					end
+					return true
+				elseif game_btn == "MenuUp" or key == "DeviceButton_up" then
+					-- Scroll up
+					if selectedIndex > 1 then
+						selectedIndex = selectedIndex - 1
+						if selectedIndex < scrollOffset then
+							scrollOffset = selectedIndex
+						end
+						SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
+						MESSAGEMAN:Broadcast("APStatusRefresh")
+					end
+					return true
+				end
+
+				return true
+			end
+
+			top:AddInputCallback(self.statusOverlayInputHandler)
+		end,
+		DirectInputToEngineFromStatusOverlayCommand = function(self)
+			local top = SCREENMAN:GetTopScreen()
+			if top and self.statusOverlayInputHandler and type(top.RemoveInputCallback) == "function" then
+				top:RemoveInputCallback(self.statusOverlayInputHandler)
+			end
+			self.statusOverlayInputHandler = nil
+
 			for player in ivalues(PlayerNumber) do
 				SCREENMAN:set_input_redirected(player, false)
 			end
+		end,
+		OffCommand = function(self)
+			self.armed = false
+			local screen = SCREENMAN:GetTopScreen()
+			if screen and type(screen.RemoveInputCallback) == "function" then
+				screen:RemoveInputCallback(F10_listener)
+			end
+			self:playcommand("DirectInputToEngineFromStatusOverlay")
 			overlay_visible = false
 		end,
 		
@@ -576,7 +607,7 @@ AP.MakeStatusOverlayActor = function()
 			
 			-- Bottom footer instructional text
 			LoadFont("Common Normal") .. {
-				Text = "Use &MENUUP;/&MENUDOWN; to scroll. Press R to sync & regenerate. Press &SELECT;, &BACK;, or ESC to exit.",
+				Text = "Use &MENUUP;/&MENUDOWN; to scroll. Press R to sync & regenerate. Press &BACK;, or ESC to exit.",
 				InitCommand = function(self)
 					self:y(paneHeight/2 - 18):zoom(0.55):diffuse(0.7, 0.7, 0.7, 1)
 				end
@@ -926,104 +957,15 @@ AP.MakeEvaluationOverlayActor = function()
 
 	local function getSLEventOverlay()
 		local screen = SCREENMAN:GetTopScreen()
-		if not screen then return nil, nil end
+		if not screen or type(screen.GetChild) ~= "function" then return nil, nil end
 		local overlay = screen:GetChild("Overlay")
-		local evalCommon = overlay and overlay:GetChild("ScreenEval Common")
-		local autoSubmitMaster = evalCommon and evalCommon:GetChild("AutoSubmitMaster")
-		local eventOverlay = autoSubmitMaster and autoSubmitMaster:GetChild("EventOverlay")
+		if not overlay or type(overlay.GetChild) ~= "function" then return nil, nil end
+		local evalCommon = overlay:GetChild("ScreenEval Common")
+		if not evalCommon or type(evalCommon.GetChild) ~= "function" then return nil, nil end
+		local autoSubmitMaster = evalCommon:GetChild("AutoSubmitMaster")
+		if not autoSubmitMaster or type(autoSubmitMaster.GetChild) ~= "function" then return nil, nil end
+		local eventOverlay = autoSubmitMaster:GetChild("EventOverlay")
 		return eventOverlay, evalCommon
-	end
-
-	local function checkAndSuppressSLEventOverlay(self)
-		if not overlay_visible then return end
-		local eventOverlay, evalCommon = getSLEventOverlay()
-		if eventOverlay and eventOverlay:GetVisible() then
-			eventOverlay:visible(false)
-			AP.pendingSLEventOverlay = true
-		end
-	end
-
-	local function input(event)
-		if not overlay_visible then return false end
-		if not event then return false end
-		
-		if event.type ~= "InputEventType_FirstPress" then
-			return true -- Consume repeat / release events while overlay is active
-		end
-		
-		local key = event.DeviceInput and event.DeviceInput.button
-		local game_btn = event.GameButton
-		
-		-- Global escape / cancel keys (may not have event.PlayerNumber)
-		if key == "DeviceButton_escape" or key == "DeviceButton_F10" or key == "DeviceButton_b" or game_btn == "Back" or game_btn == "Select" then
-			AP.FinalizeEvaluationAndSendChecks()
-			toggleOverlay()
-			return true
-		end
-		
-		if not (event.PlayerNumber and event.button) then
-			return true
-		end
-		
-		local available_items = AP.GetAvailableBonusItems()
-		local proposed_sum = proposed_items.money + proposed_items.ex + proposed_items.hex
-		
-		if game_btn == "MenuUp" or key == "DeviceButton_up" then
-			selected_row = selected_row - 1
-			if selected_row < 1 then selected_row = 3 end
-			SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
-			MESSAGEMAN:Broadcast("APBonusRefresh")
-		elseif game_btn == "MenuDown" or key == "DeviceButton_down" then
-			selected_row = selected_row + 1
-			if selected_row > 3 then selected_row = 1 end
-			SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
-			MESSAGEMAN:Broadcast("APBonusRefresh")
-		elseif game_btn == "MenuRight" or key == "DeviceButton_right" then
-			if proposed_sum < available_items then
-				if selected_row == 1 then
-					proposed_items.money = proposed_items.money + 1
-				elseif selected_row == 2 then
-					proposed_items.ex = proposed_items.ex + 1
-				elseif selected_row == 3 then
-					proposed_items.hex = proposed_items.hex + 1
-				end
-				SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
-				MESSAGEMAN:Broadcast("APBonusRefresh")
-			else
-				SOUND:PlayOnce(THEME:GetPathS("Common", "Invalid"))
-			end
-		elseif game_btn == "MenuLeft" or key == "DeviceButton_left" then
-			local current_val = 0
-			if selected_row == 1 then current_val = proposed_items.money
-			elseif selected_row == 2 then current_val = proposed_items.ex
-			elseif selected_row == 3 then current_val = proposed_items.hex
-			end
-			
-			if current_val > 0 then
-				if selected_row == 1 then
-					proposed_items.money = proposed_items.money - 1
-				elseif selected_row == 2 then
-					proposed_items.ex = proposed_items.ex - 1
-				elseif selected_row == 3 then
-					proposed_items.hex = proposed_items.hex - 1
-				end
-				SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
-				MESSAGEMAN:Broadcast("APBonusRefresh")
-			else
-				SOUND:PlayOnce(THEME:GetPathS("Common", "Invalid"))
-			end
-		elseif game_btn == "Start" then
-			if proposed_sum > 0 then
-				AP.LastEvaluation.proposed_items = proposed_items
-				AP.ApplyBonusPercentage(AP.LastEvaluation.chart_name, proposed_items)
-				SOUND:PlayOnce(THEME:GetPathS("Common", "Start"))
-			else
-				AP.FinalizeEvaluationAndSendChecks()
-			end
-			toggleOverlay()
-		end
-		
-		return true
 	end
 
 	toggleOverlay = function(self)
@@ -1036,49 +978,15 @@ AP.MakeEvaluationOverlayActor = function()
 		elseif st == 2 then selected_row = 3
 		end
 		
-		local screen = SCREENMAN:GetTopScreen()
-		if not screen then return end
-		
-		local eventOverlay, evalCommon = getSLEventOverlay()
-
 		if overlay_visible then
 			SOUND:PlayOnce(THEME:GetPathS("Common", "Start"))
-			
-			-- If Simply Love's EventOverlay is already visible when we open, hide and defer it
-			if eventOverlay and eventOverlay:GetVisible() then
-				eventOverlay:visible(false)
-				AP.pendingSLEventOverlay = true
-			end
-
-			for player in ivalues(PlayerNumber) do
-				SCREENMAN:set_input_redirected(player, true)
-			end
-
 			if evaluation_overlay_actor then
-				evaluation_overlay_actor:SetUpdateFunction(checkAndSuppressSLEventOverlay)
+				evaluation_overlay_actor:playcommand("DirectInputToAPEvalOverlay")
 			end
 		else
 			SOUND:PlayOnce(THEME:GetPathS("Common", "Cancel"))
-
 			if evaluation_overlay_actor then
-				evaluation_overlay_actor:SetUpdateFunction(nil)
-			end
-
-			-- Handoff to pending SL EventOverlay if one arrived while we were active
-			if AP.pendingSLEventOverlay and eventOverlay and evalCommon then
-				eventOverlay:visible(true)
-				evalCommon:queuecommand("DirectInputToEventOverlayHandler")
-				AP.pendingSLEventOverlay = false
-			else
-				-- If no SL EventOverlay is pending or currently visible, safely return input to engine
-				if not (eventOverlay and eventOverlay:GetVisible()) then
-					for player in ivalues(PlayerNumber) do
-						SCREENMAN:set_input_redirected(player, false)
-					end
-					if evalCommon then
-						evalCommon:queuecommand("DirectInputToEngine")
-					end
-				end
+				evaluation_overlay_actor:queuecommand("DirectInputToEngineFromEvalOverlay")
 			end
 		end
 		
@@ -1086,6 +994,7 @@ AP.MakeEvaluationOverlayActor = function()
 	end
 
 	local function F10_listener(event)
+		if overlay_visible then return false end
 		if event.type == "InputEventType_FirstPress" and event.DeviceInput and event.DeviceInput.button == "DeviceButton_F10" then
 			if evaluation_overlay_actor then
 				evaluation_overlay_actor:playcommand("ToggleOverlay")
@@ -1099,17 +1008,35 @@ AP.MakeEvaluationOverlayActor = function()
 		Name = "APEvaluationOverlayMain",
 		InitCommand = function(self)
 			evaluation_overlay_actor = self
+			self.evalOverlayInputHandler = nil
+			self.armed = false
 			overlay_visible = false
-			proposed_items = 0
+			proposed_items = { money = 0, ex = 0, hex = 0 }
+		end,
+		ScreenChangedMessageCommand = function(self)
+			if not self.armed then return end
+			local screen = SCREENMAN:GetTopScreen()
+			if not screen or not screen:GetName():find("ScreenEvaluation") then
+				self.armed = false
+				self:playcommand("DirectInputToEngineFromEvalOverlay")
+				overlay_visible = false
+				AP.pendingSLEventOverlay = false
+				AP.FinalizeEvaluationAndSendChecks()
+			end
 		end,
 		ModuleCommand = function(self)
+			self:stoptweening()
+			self.armed = true
 			local screen = SCREENMAN:GetTopScreen()
 			if screen then
 				screen:RemoveInputCallback(F10_listener)
 				screen:AddInputCallback(F10_listener)
-				screen:RemoveInputCallback(input)
-				screen:AddInputCallback(input)
 			end
+			
+			-- Defensively release any leftover input redirection (e.g. from Ctrl+R restarts)
+			self:playcommand("DirectInputToEngineFromEvalOverlay")
+			
+			overlay_visible = false
 			AP.pendingSLEventOverlay = false
 			MESSAGEMAN:Broadcast("APBonusRefresh")
 			
@@ -1126,16 +1053,147 @@ AP.MakeEvaluationOverlayActor = function()
 				toggleOverlay(self)
 			end
 		end,
-		OffCommand = function(self)
-			self:SetUpdateFunction(nil)
-			local screen = SCREENMAN:GetTopScreen()
-			if screen then
-				screen:RemoveInputCallback(F10_listener)
-				screen:RemoveInputCallback(input)
+		DirectInputToAPEvalOverlayCommand = function(self)
+			local top = SCREENMAN:GetTopScreen()
+			if not top then return end
+
+			local eventOverlay, evalCommon = getSLEventOverlay()
+			if eventOverlay and eventOverlay:GetVisible() then
+				eventOverlay:visible(false)
+				AP.pendingSLEventOverlay = true
+			end
+
+			for player in ivalues(PlayerNumber) do
+				SCREENMAN:set_input_redirected(player, true)
+			end
+
+			if self.evalOverlayInputHandler then return end
+
+			self.evalOverlayInputHandler = function(event)
+				if not overlay_visible then return false end
+
+				-- Re-assert input redirection on every event while overlay is active
 				for player in ivalues(PlayerNumber) do
-					SCREENMAN:set_input_redirected(player, false)
+					SCREENMAN:set_input_redirected(player, true)
+				end
+
+				if not event then return false end
+				if event.type ~= "InputEventType_FirstPress" then
+					return true -- Consume repeat / release events while overlay is active
+				end
+
+				local key = event.DeviceInput and event.DeviceInput.button
+				local game_btn = event.GameButton
+
+				-- Global escape / cancel keys (may not have event.PlayerNumber)
+				if key == "DeviceButton_escape" or key == "DeviceButton_F10" or key == "DeviceButton_b" or game_btn == "Back" then
+					AP.FinalizeEvaluationAndSendChecks()
+					toggleOverlay(self)
+					return true
+				end
+
+				if not (event.PlayerNumber and event.button) then
+					return true
+				end
+
+				local available_items = AP.GetAvailableBonusItems()
+				local proposed_sum = proposed_items.money + proposed_items.ex + proposed_items.hex
+
+				if game_btn == "MenuUp" or key == "DeviceButton_up" then
+					selected_row = selected_row - 1
+					if selected_row < 1 then selected_row = 3 end
+					SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
+					MESSAGEMAN:Broadcast("APBonusRefresh")
+					return true
+				elseif game_btn == "MenuDown" or key == "DeviceButton_down" then
+					selected_row = selected_row + 1
+					if selected_row > 3 then selected_row = 1 end
+					SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
+					MESSAGEMAN:Broadcast("APBonusRefresh")
+					return true
+				elseif game_btn == "MenuRight" or key == "DeviceButton_right" then
+					if proposed_sum < available_items then
+						if selected_row == 1 then
+							proposed_items.money = proposed_items.money + 1
+						elseif selected_row == 2 then
+							proposed_items.ex = proposed_items.ex + 1
+						elseif selected_row == 3 then
+							proposed_items.hex = proposed_items.hex + 1
+						end
+						SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
+						MESSAGEMAN:Broadcast("APBonusRefresh")
+					else
+						SOUND:PlayOnce(THEME:GetPathS("Common", "Invalid"))
+					end
+					return true
+				elseif game_btn == "MenuLeft" or key == "DeviceButton_left" then
+					local current_val = 0
+					if selected_row == 1 then current_val = proposed_items.money
+					elseif selected_row == 2 then current_val = proposed_items.ex
+					elseif selected_row == 3 then current_val = proposed_items.hex
+					end
+
+					if current_val > 0 then
+						if selected_row == 1 then
+							proposed_items.money = proposed_items.money - 1
+						elseif selected_row == 2 then
+							proposed_items.ex = proposed_items.ex - 1
+						elseif selected_row == 3 then
+							proposed_items.hex = proposed_items.hex - 1
+						end
+						SOUND:PlayOnce(THEME:GetPathS("ScreenSelectMaster", "change"))
+						MESSAGEMAN:Broadcast("APBonusRefresh")
+					else
+						SOUND:PlayOnce(THEME:GetPathS("Common", "Invalid"))
+					end
+					return true
+				elseif game_btn == "Start" then
+					if proposed_sum > 0 then
+						AP.LastEvaluation.proposed_items = proposed_items
+						AP.ApplyBonusPercentage(AP.LastEvaluation.chart_name, proposed_items)
+						SOUND:PlayOnce(THEME:GetPathS("Common", "Start"))
+					else
+						AP.FinalizeEvaluationAndSendChecks()
+					end
+					toggleOverlay(self)
+					return true
+				end
+
+				return true
+			end
+
+			top:AddInputCallback(self.evalOverlayInputHandler)
+		end,
+		DirectInputToEngineFromEvalOverlayCommand = function(self)
+			local top = SCREENMAN:GetTopScreen()
+			if top and self.evalOverlayInputHandler and type(top.RemoveInputCallback) == "function" then
+				top:RemoveInputCallback(self.evalOverlayInputHandler)
+			end
+			self.evalOverlayInputHandler = nil
+
+			local eventOverlay, evalCommon = getSLEventOverlay()
+			if AP.pendingSLEventOverlay and eventOverlay and evalCommon then
+				eventOverlay:visible(true)
+				evalCommon:queuecommand("DirectInputToEventOverlayHandler")
+				AP.pendingSLEventOverlay = false
+			else
+				if not (eventOverlay and eventOverlay:GetVisible()) then
+					for player in ivalues(PlayerNumber) do
+						SCREENMAN:set_input_redirected(player, false)
+					end
+					if evalCommon then
+						evalCommon:queuecommand("DirectInputToEngine")
+					end
 				end
 			end
+		end,
+		OffCommand = function(self)
+			self.armed = false
+			local screen = SCREENMAN:GetTopScreen()
+			if screen and type(screen.RemoveInputCallback) == "function" then
+				screen:RemoveInputCallback(F10_listener)
+			end
+			self:playcommand("DirectInputToEngineFromEvalOverlay")
 			overlay_visible = false
 			AP.pendingSLEventOverlay = false
 			-- Ensure checks are finalized and sent if leaving screen
@@ -1302,7 +1360,7 @@ AP.MakeEvaluationOverlayActor = function()
 			
 			-- Footer / Help instructions
 			LoadFont("Common Normal") .. {
-				Text = "Use &MENUUP;/&MENUDOWN; to select score, &MENULEFT;/&MENURIGHT; to adjust. Press &START; to apply, &SELECT;/&BACK; to cancel.",
+				Text = "Use &MENUUP;/&MENUDOWN; to select score, &MENULEFT;/&MENURIGHT; to adjust. Press &START; to apply, &BACK; to cancel.",
 				InitCommand = function(self)
 					self:y(paneHeight/2 - 18):zoom(0.52):diffuse(0.7, 0.7, 0.7, 1)
 				end
