@@ -58,7 +58,7 @@ The project is organized into two primary components:
 ## 🚀 Quick Start Guide
 
 ### Prerequisites
-* [ITGMania](https://www.itgmania.com/) (0.9.0+)
+* [ITGMania](https://www.itgmania.com/) (1.3.0+)
 * [Simply Love](https://github.com/itgmania/simply-love-itgmania) theme
 
 ### 1. Client Installation (ITGMania)
